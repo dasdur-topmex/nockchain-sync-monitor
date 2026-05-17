@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+#
+# Nockchain Metrics (nockmon)
+# Single-pass log analysis with peer + mining heartbeat + network metrics
+#
+
+set -euo pipefail
+
+SERVICE_NAME="nockchain.service"
+ANALYSIS_WINDOW=24
+
+# NockBlocks RPC (optional; used to auto-fetch tip height if NOCKBLOCKS_API_KEY is set)
+NOCKBLOCKS_RPC_URL_DEFAULT="https://nockblocks.com/rpc/v1"
+NOCKBLOCKS_RPC_URL="${NOCKBLOCKS_RPC_URL:-$NOCKBLOCKS_RPC_URL_DEFAULT}"
+
+# Tip height:
+# - If user passes -t/--tip, use that
+# - Else if NOCKBLOCKS_API_KEY is set, fetch tip via RPC
+# - Else leave empty (ETA section will be skipped)
+TIP_HEIGHT="${TIP_HEIGHT:-}"
+
+# Log patterns
+ACCEPT_RE='added to validated blocks at'
+ACCEPT_HINT='accept-block: block '
+BACKFILL_RE='Missing transactions'  # Only count actual issues, not normal catch-up behavior
+
+# Peer metrics patterns (periodic "timer" status log lines)
+PEERS_RE='connected_peers='
+ROUTING_RE='routing_table_size='
+
+# Mining heartbeat pattern
+MINING_HEARTBEAT_RE='candidate block timestamp updated'
+
+# Colors
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[1;33m'
+readonly BLUE=$'\033[0;34m'
+readonly NC=$'\033[0m'
+
+print_color() { echo -e "${1}${2}${NC}"; }
+
+usage() {
+cat <<EOF
+nockmon - Nockchain Metrics
+
+Usage:
+  nockmon [OPTIONS]
+
+Options:
+  -s, --service NAME         systemd user service (default: nockchain.service)
+  -w, --window HOURS         analysis window in hours (default: 24, min: 24)
+  -t, --tip HEIGHT           chain tip height (enables ETA calculation)
+      --tip-from-api         force fetching tip from NockBlocks API (requires NOCKBLOCKS_API_KEY)
+      --rpc-url URL          NockBlocks RPC URL (default: https://nockblocks.com/rpc/v1)
+  -h, --help                 show this help
+
+Env:
+  NOCKBLOCKS_API_KEY         NockBlocks API key (sent as x-api-key header)
+  NOCKBLOCKS_RPC_URL         override RPC url (same as --rpc-url)
+
+EOF
+exit 0
+}
+
+TIP_FROM_API=0
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--service) SERVICE_NAME="$2"; shift 2 ;;
+      -w|--window)  ANALYSIS_WINDOW="$2"; shift 2 ;;
+      -t|--tip)     TIP_HEIGHT="$2"; shift 2 ;;
+      --tip-from-api) TIP_FROM_API=1; shift 1 ;;
+      --rpc-url)    NOCKBLOCKS_RPC_URL="$2"; shift 2 ;;
+      -h|--help)    usage ;;
+      *) echo "Unknown option: $1" >&2; usage ;;
+    esac
+  done
+
+  if [[ "$ANALYSIS_WINDOW" -lt 24 ]]; then
+    print_color "$YELLOW" "Warning: Window adjusted to 24h minimum for full metrics"
+    ANALYSIS_WINDOW=24
+  fi
+
+  if [[ -n "${TIP_HEIGHT:-}" && ! "$TIP_HEIGHT" =~ ^[0-9]+$ ]]; then
+    print_color "$RED" "Error: Tip height must be a positive integer"
+    exit 1
+  fi
+}
+
+check_deps() {
+  command -v journalctl >/dev/null || { echo "Error: journalctl not found" >&2; exit 1; }
+  command -v awk >/dev/null || { echo "Error: awk not found" >&2; exit 1; }
+  command -v date >/dev/null || { echo "Error: date not found" >&2; exit 1; }
+  command -v sed >/dev/null || { echo "Error: sed not found" >&2; exit 1; }
+
+  # For API tip fetch (optional)
+  command -v curl >/dev/null || { echo "Error: curl not found" >&2; exit 1; }
+  command -v jq >/dev/null || { echo "Error: jq not found (sudo apt install -y jq)" >&2; exit 1; }
+
+  # Verify GNU date (Linux)
+  if ! date -d "1 hour ago" +%s >/dev/null 2>&1; then
+    echo "Error: GNU date required (Linux only)" >&2
+    exit 1
+  fi
+}
+
+print_header() {
+  # Exact banner (match your journal output) — KEEP AS-IS
+  print_color "$RED" "    _   _            _        _           _"
+  print_color "$RED" "   | \\ | | ___   ___| | _____| |__   __ _(_)_ __"
+  print_color "$RED" "   |  \\| |/ _ \\ / __| |/ / __| '_ \\ / _\` | | '_ \\"
+  print_color "$RED" "   | |\\  | (_) | (__|   < (__| | | | (_| | | | | |"
+  print_color "$RED" "   |_| \\_|\\___/ \\___|_|\\_\\___|_| |_|\\__,_|_|_| |_|"
+  echo ""
+  print_color "$BLUE" "Nockchain Metrics"
+  echo ""
+}
+
+fetch_tip_from_api() {
+  # Requires NOCKBLOCKS_API_KEY env var
+  if [[ -z "${NOCKBLOCKS_API_KEY:-}" ]]; then
+    print_color "$YELLOW" "NOCKBLOCKS_API_KEY not set; skipping tip fetch"
+    return 1
+  fi
+
+  local body hdr status
+  body="$(mktemp)"
+  hdr="$(mktemp)"
+  trap 'rm -f "$body" "$hdr"' RETURN
+
+  # JSON-RPC getTip
+  curl --http1.1 -sS \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: ${NOCKBLOCKS_API_KEY}" \
+    --data '{"jsonrpc":"2.0","method":"getTip","params":[{"includeTransactions":false}],"id":1}' \
+    -D "$hdr" \
+    -o "$body" \
+    --max-time 12 \
+    "$NOCKBLOCKS_RPC_URL" || {
+      print_color "$YELLOW" "Tip fetch failed (curl transport error)"
+      return 1
+    }
+
+  status="$(head -n 1 "$hdr" | awk '{print $2}')"
+  if [[ "${status:-}" != "200" ]]; then
+    # show a tight reason + CF-RAY if present
+    local cf_ray msg
+    cf_ray="$(grep -i '^cf-ray:' "$hdr" 2>/dev/null | head -n 1 | sed -E 's/^[^:]+:\s*//I' || true)"
+    msg="$(head -c 200 "$body" 2>/dev/null || true)"
+    print_color "$YELLOW" "Tip fetch non-200 (HTTP ${status:-?})${cf_ray:+ CF-RAY=$cf_ray} body='${msg}'"
+    return 1
+  fi
+
+  # Parse: result.height, result.digest, result.timestamp
+  local tip_height tip_digest tip_ts
+  tip_height="$(jq -er '.result.height' < "$body" 2>/dev/null)" || {
+    print_color "$YELLOW" "Tip fetch parse error (missing .result.height)"
+    return 1
+  }
+  tip_digest="$(jq -r '.result.digest // ""' < "$body" 2>/dev/null || true)"
+  tip_ts="$(jq -er '.result.timestamp' < "$body" 2>/dev/null)" || {
+    print_color "$YELLOW" "Tip fetch parse error (missing .result.timestamp)"
+    return 1
+  }
+
+  echo "${tip_height}|${tip_digest}|${tip_ts}"
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  check_deps
+
+  since_ts="$(date -d "${ANALYSIS_WINDOW} hours ago" "+%Y-%m-%d %H:%M:%S")"
+  now_epoch="$(date +%s)"
+
+  # Auto tip fetch:
+  # - If --tip-from-api, always try
+  # - Else if TIP_HEIGHT not set and NOCKBLOCKS_API_KEY set, try
+  NET_TIP_HEIGHT=""
+  NET_TIP_DIGEST=""
+  NET_TIP_TS=""
+  if (( TIP_FROM_API == 1 )) || [[ -z "${TIP_HEIGHT:-}" && -n "${NOCKBLOCKS_API_KEY:-}" ]]; then
+    if tip_triplet="$(fetch_tip_from_api)"; then
+      NET_TIP_HEIGHT="${tip_triplet%%|*}"
+      rest="${tip_triplet#*|}"
+      NET_TIP_DIGEST="${rest%%|*}"
+      NET_TIP_TS="${rest##*|}"
+      TIP_HEIGHT="$NET_TIP_HEIGHT"
+    fi
+  fi
+
+  # Improvement: stream journal directly into awk (no tmpfile)
+  awk_out="$(
+    journalctl --user -u "$SERVICE_NAME" \
+      --since "$since_ts" --no-pager -o short-unix 2>/dev/null \
+    | awk \
+        -v now="$now_epoch" \
+        -v accept_re="$ACCEPT_RE" \
+        -v accept_hint="$ACCEPT_HINT" \
+        -v backfill_re="$BACKFILL_RE" \
+        -v mining_re="$MINING_HEARTBEAT_RE" \
+        -v peers_re="$PEERS_RE" \
+        -v routing_re="$ROUTING_RE" \
+        -v green="$GREEN" -v yellow="$YELLOW" -v red="$RED" -v nc="$NC" \
+        '
+        BEGIN { saw=0 }
+        function color_ratio(r, s) {
+          s = sprintf("%.2f", r)
+          if (r <= 0.5) return green s nc
+          if (r <= 1.5) return yellow s nc
+          return red s nc
+        }
+        function color_bph(h, s) {
+          s = sprintf("%.2f", h)
+          if (h >= 20) return green s nc
+          if (h >= 10) return yellow s nc
+          return red s nc
+        }
+        function upd(ts, w, height, is_accept, is_backfill) {
+          if (ts < now - (w*3600)) return
+          if (is_backfill) backfill[w]++
+          if (is_accept) {
+            accepted[w]++
+            if (first[w] == "") first[w] = height
+            last[w] = height
+          }
+        }
+        {
+          saw=1
+          split($1,t,".")
+          ts = t[1] + 0
+          line = $0
+
+          # Mining heartbeat counts (6/12/24)
+          if (tolower(line) ~ tolower(mining_re)) {
+            if (ts >= now - (6*3600))  mining6h++
+            if (ts >= now - (12*3600)) mining12h++
+            if (ts >= now - (24*3600)) mining24h++
+          }
+
+          # Peer metrics: capture most recent connected_peers and routing_table_size in entire window
+          if (index(line, peers_re)) {
+            if (match(line, /connected_peers=[0-9]+/)) {
+              s = substr(line, RSTART, RLENGTH)
+              sub(/connected_peers=/, "", s)
+              last_connected_peers = s
+              peers_ts = ts
+            }
+          }
+          if (index(line, routing_re)) {
+            if (match(line, /routing_table_size=[0-9]+/)) {
+              s = substr(line, RSTART, RLENGTH)
+              sub(/routing_table_size=/, "", s)
+              last_routing_size = s
+              routing_ts = ts
+            }
+          }
+
+          is_backfill = (line ~ backfill_re)
+
+          is_accept = 0
+          height = ""
+          if (index(line, accept_re) && index(line, accept_hint)) {
+            if (match(line,/added to validated blocks at [0-9]+/)) {
+              s = substr(line,RSTART,RLENGTH)
+              sub(/.* /,"",s)
+              height = s
+              is_accept = 1
+              curr_height = s
+              latest_ts = ts
+            }
+          }
+
+          upd(ts,6,height,is_accept,is_backfill)
+          upd(ts,12,height,is_accept,is_backfill)
+          upd(ts,24,height,is_accept,is_backfill)
+        }
+        END {
+          if (!saw) { print "NOLOGS"; exit 0 }
+
+          for (i=1;i<=3;i++) {
+            w = (i==1?6:(i==2?12:24))
+            a = accepted[w]+0
+            b = backfill[w]+0
+            d = (a>0 && first[w]!="" && last[w]!="") ? (last[w]-first[w]) : 0
+            r = (a>0)? b/a : 0
+            h = (d>0)? d/w : 0
+
+            printf "%2dh | accepted=%d backfill=%d ratio=%s delta=%d blocks/hr=%s\n",
+              w,a,b,color_ratio(r),d,color_bph(h)
+
+            if (w==24) { delta24=d; bph24=h }
+          }
+
+          printf "SUMMARY curr=%d delta24=%d bph24=%.6f ts=%d peers=%s routing=%s mining6h=%d mining12h=%d mining24h=%d\n",
+            curr_height+0, delta24+0, bph24+0.0, latest_ts+0,
+            (last_connected_peers=="" ? "?" : last_connected_peers),
+            (last_routing_size=="" ? "?" : last_routing_size),
+            mining6h+0, mining12h+0, mining24h+0
+        }
+      '
+  )"
+
+  if [[ "$awk_out" == "NOLOGS" ]]; then
+    print_header
+    print_color "$YELLOW" "No logs found for service '$SERVICE_NAME' in last ${ANALYSIS_WINDOW}h"
+    exit 0
+  fi
+
+  summary="$(echo "$awk_out" | awk '/^SUMMARY /{print; exit}')"
+
+  curr="$(echo "$summary" | sed -E 's/.*curr=([0-9]+).*/\1/')"
+  bph24="$(echo "$summary" | sed -E 's/.*bph24=([0-9.]+).*/\1/')"
+  latest_ts="$(echo "$summary" | sed -E 's/.*ts=([0-9]+).*/\1/')"
+  peers="$(echo "$summary" | sed -E 's/.*peers=([^ ]+).*/\1/')"
+  routing="$(echo "$summary" | sed -E 's/.*routing=([^ ]+).*/\1/')"
+  mining6h="$(echo "$summary" | sed -E 's/.*mining6h=([0-9]+).*/\1/')"
+  mining12h="$(echo "$summary" | sed -E 's/.*mining12h=([0-9]+).*/\1/')"
+  mining24h="$(echo "$summary" | sed -E 's/.*mining24h=([0-9]+).*/\1/')"
+
+  print_header
+
+  # 👥 Peer Metrics
+  print_color "$GREEN" "👥 Peer Metrics"
+  echo "----------------------------------------"
+  echo "connected_peers=${peers}"
+  echo "routing_table_size=${routing}"
+  echo ""
+
+  # ⛏️ Mining Metrics (6/12/24)
+  print_color "$GREEN" "⛏️ Mining Metrics"
+  echo "----------------------------------------"
+  echo " 6h | candidate_block_timestamp_updated=${mining6h}"
+  echo "12h | candidate_block_timestamp_updated=${mining12h}"
+  echo "24h | candidate_block_timestamp_updated=${mining24h}"
+  echo ""
+
+  # Sync Metrics
+  print_color "$GREEN" "Sync Metrics"
+  echo "----------------------------------------"
+
+  if [[ "$curr" -gt 0 && "$latest_ts" -gt 0 ]]; then
+    latest_time="$(date -d "@${latest_ts}" "+%b %e %H:%M:%S")"
+    echo "${latest_time} height=${curr}"
+  else
+    print_color "$YELLOW" "No block data in last ${ANALYSIS_WINDOW}h"
+    exit 0
+  fi
+
+  echo "$awk_out" | grep -v '^SUMMARY '
+  echo ""
+
+  # 🌐 Network Metrics (Avg Block Time from 24h blocks/hr)
+  print_color "$GREEN" "🌐 Network Metrics"
+  echo "----------------------------------------"
+  if awk "BEGIN{exit !($bph24 > 0.000001)}"; then
+    block_time_min=$(awk -v r="$bph24" 'BEGIN{printf "%.2f", 60/r}')
+    printf "Avg. Block Time (24h): %s min\n" "$block_time_min"
+  else
+    echo "Avg. Block Time (24h): insufficient data"
+  fi
+  echo ""
+
+  # Optional tip ETA (now supports API auto-fetch)
+  if [[ -n "${TIP_HEIGHT:-}" ]]; then
+    print_color "$GREEN" "Sync Progress to Tip"
+    echo "----------------------------------------"
+
+    # If we fetched from API, show the metadata (nice for debugging)
+    if [[ -n "${NET_TIP_HEIGHT:-}" ]]; then
+      echo "Tip source:     NockBlocks API (${NOCKBLOCKS_RPC_URL})"
+      if [[ -n "${NET_TIP_TS:-}" ]]; then
+        tip_time="$(date -d "@${NET_TIP_TS}" "+%b %e %H:%M:%S")"
+        echo "Tip time:       ${tip_time} (ts=${NET_TIP_TS})"
+      fi
+      if [[ -n "${NET_TIP_DIGEST:-}" ]]; then
+        echo "Tip digest:     ${NET_TIP_DIGEST}"
+      fi
+      echo ""
+    fi
+
+    if (( TIP_HEIGHT <= curr )); then
+      print_color "$GREEN" "✓ Synced! Current height ($curr) ≥ tip ($TIP_HEIGHT)"
+      exit 0
+    fi
+
+    remaining=$((TIP_HEIGHT - curr))
+    progress=$(awk -v c="$curr" -v t="$TIP_HEIGHT" 'BEGIN{printf "%.1f", (c/t)*100}')
+
+    echo "Tip height:     $TIP_HEIGHT"
+    echo "Current height: $curr"
+    echo "Progress:       ${progress}%"
+    echo "Remaining:      $remaining blocks"
+
+    if awk "BEGIN{exit !($bph24 > 0.000001)}"; then
+      eta_hours=$(awk -v r="$remaining" -v h="$bph24" 'BEGIN{printf "%.1f", r/h}')
+      eta_seconds=$(awk -v r="$remaining" -v h="$bph24" 'BEGIN{printf "%.0f", (r/h)*3600}')
+      eta_time=$(date -d "@$((now_epoch + eta_seconds))" "+%b %e %H:%M:%S")
+      bph24_display=$(printf "%.2f" "$bph24")
+
+      echo "Sync rate:      ${bph24_display} blocks/hr (24h avg)"
+      echo "ETA:            ${eta_hours}h (~${eta_time})"
+    else
+      bph24_display=$(printf "%.2f" "$bph24")
+      echo "Sync rate:      ${bph24_display} blocks/hr (too slow for ETA)"
+    fi
+  else
+    print_color "$YELLOW" "Tip height not set. To enable ETA:"
+    echo "  - pass -t <height>, OR"
+    echo "  - set NOCKBLOCKS_API_KEY (auto-fetch), OR"
+    echo "  - run with --tip-from-api"
+  fi
+}
+
+main "$@"
