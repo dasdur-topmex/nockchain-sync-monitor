@@ -1,8 +1,8 @@
 # nockmon
 
-Terminal monitor for Nockchain node sync, peer, mining/prover heartbeat, and optional NockBlocks tip metrics.
+Terminal monitor for Nockchain PMA sync progress, peer connectivity, mining heartbeat, and optional NockBlocks tip tracking.
 
-Useful for monitoring PMA-era resync progress.
+Built to help monitor long PMA-era resyncs and diagnose node health during catch-up.
 
 ## Requirements
 
