@@ -1,4 +1,4 @@
-# nockmon
+# Nockchain Sync Monitor
 
 Terminal monitor for Nockchain PMA sync progress, peer connectivity, mining heartbeat, and optional NockBlocks tip tracking.
 
@@ -11,6 +11,23 @@ Built to help monitor long PMA-era resyncs and diagnose node health during catch
 - awk
 - curl
 - jq
+
+## Install
+
+    git clone https://github.com/dasdur-topmex/nockchain-sync-monitor.git
+    cd nockchain-sync-monitor
+    chmod +x nockmon
+    ./nockmon
+
+## Assumptions
+
+By default, nockmon reads logs from a systemd user service named:
+
+    nockchain.service
+
+Specifically:
+
+    journalctl --user -u nockchain.service
 
 ## Usage
 
@@ -27,7 +44,7 @@ With NockBlocks tip API:
 
 To run nockmon from anywhere:
 
-    echo "alias nockmon='$HOME/nockmon/nockmon'" >> ~/.bash_aliases
+    echo "alias nockmon='$HOME/nockchain-sync-monitor/nockmon'" >> ~/.bash_aliases
     source ~/.bash_aliases
 
 Then run:
