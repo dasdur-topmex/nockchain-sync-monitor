@@ -4,6 +4,8 @@ Terminal monitor for Nockchain PMA sync progress, peer connectivity, mining hear
 
 Built to help monitor long PMA-era resyncs and diagnose node health during catch-up.
 
+When used with the optional NockBlocks API, nockmon can estimate sync progress to current chain tip, including percentage complete, remaining blocks, sync rate, ETA, and network timing metrics.
+
 ## Requirements
 
 - bash
@@ -50,6 +52,26 @@ To run nockmon from anywhere:
 Then run:
 
     nockmon
+
+## Features
+
+Without NockBlocks API:
+
+- local sync progression
+- accepted/backfill metrics
+- peer connectivity metrics
+- routing table metrics
+- mining/prover heartbeat metrics
+
+With NockBlocks API:
+
+- live chain tip height
+- sync percentage
+- remaining blocks
+- sync rate (blocks/hr)
+- estimated completion time (ETA)
+- network block timing metrics
+- tip digest/time visibility
 
 ## Notes
 
